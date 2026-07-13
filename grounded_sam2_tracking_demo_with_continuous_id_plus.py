@@ -30,6 +30,7 @@ def parse_args():
     parser.add_argument("--step", type=int, default=20, help="Run Grounding DINO every N images.")
     parser.add_argument("--save_video", action="store_true", help="Also save an mp4 visualization video.")
     parser.add_argument("--output_video_path", default="./outputs/output.mp4", help="Output video path when --save_video is set.")
+    parser.add_argument("--propainter_mask_dir", default="propainter_masks", help="Subdirectory to save ProPainter-compatible binary PNG masks.")
     return parser.parse_args()
 
 
@@ -42,6 +43,18 @@ def list_images(image_dir):
     if not image_names:
         raise RuntimeError(f"No images found in {image_dir}")
     return image_names
+
+
+def save_propainter_mask(mask_array, output_path):
+    propainter_mask = (mask_array > 0).astype(np.uint8) * 255
+    cv2.imwrite(output_path, propainter_mask)
+
+
+def save_empty_propainter_masks(image_name_list, mask_height, mask_width, output_dir):
+    empty_mask = np.zeros((mask_height, mask_width), dtype=np.uint8)
+    for image_name in image_name_list:
+        image_base_name = os.path.splitext(image_name)[0]
+        cv2.imwrite(os.path.join(output_dir, f"mask_{image_base_name}.png"), empty_mask)
 
 
 def prepare_sam2_jpeg_frames(image_dir, image_names, output_dir):
@@ -107,8 +120,12 @@ output_video_path = args.output_video_path
 mask_data_dir = os.path.join(output_dir, "mask_data")
 json_data_dir = os.path.join(output_dir, "json_data")
 result_dir = os.path.join(output_dir, "result")
+propainter_mask_dir = os.path.join(output_dir, args.propainter_mask_dir)
 CommonUtils.creat_dirs(mask_data_dir)
 CommonUtils.creat_dirs(json_data_dir)
+if os.path.exists(propainter_mask_dir):
+    shutil.rmtree(propainter_mask_dir)
+CommonUtils.creat_dirs(propainter_mask_dir)
 # scan all image names in this directory and prepare SAM2-compatible JPEG frames
 frame_names = list_images(image_dir)
 video_dir = prepare_sam2_jpeg_frames(image_dir, frame_names, output_dir)
@@ -194,7 +211,9 @@ for start_frame_idx in range(0, len(frame_names), step):
     print("objects_count", objects_count)
     
     if len(mask_dict.labels) == 0:
-        mask_dict.save_empty_mask_and_json(mask_data_dir, json_data_dir, image_name_list = frame_names[start_frame_idx:start_frame_idx+step])
+        empty_frame_names = frame_names[start_frame_idx:start_frame_idx+step]
+        mask_dict.save_empty_mask_and_json(mask_data_dir, json_data_dir, image_name_list=empty_frame_names)
+        save_empty_propainter_masks(empty_frame_names, mask_dict.mask_height, mask_dict.mask_width, propainter_mask_dir)
         print("No object detected in the frame, skip the frame {}".format(start_frame_idx))
         continue
     else:
@@ -237,6 +256,8 @@ for start_frame_idx in range(0, len(frame_names), step):
 
         mask_img = mask_img.numpy().astype(np.uint16)
         np.save(os.path.join(mask_data_dir, frame_masks_info.mask_name), mask_img)
+        propainter_mask_name = frame_masks_info.mask_name.replace(".npy", ".png")
+        save_propainter_mask(mask_img, os.path.join(propainter_mask_dir, propainter_mask_name))
 
         json_data_path = os.path.join(json_data_dir, frame_masks_info.mask_name.replace(".npy", ".json"))
         frame_masks_info.to_json(json_data_path)
@@ -295,6 +316,7 @@ for frame_idx, current_object_count in frame_object_count.items():
             mask_array[object_info.mask] = out_obj_id
         
         np.save(mask_data_path, mask_array)
+        save_propainter_mask(mask_array, os.path.join(propainter_mask_dir, f"mask_{image_base_name}.png"))
         json_data.to_json(json_data_path)
 
         
