@@ -249,20 +249,32 @@ start_object_id = 0
 object_info_dict = {}
 for frame_idx, current_object_count in frame_object_count.items():
     print("reverse tracking frame", frame_idx, frame_names[frame_idx])
-    if frame_idx != 0:
-        video_predictor.reset_state(inference_state)
-        image_base_name = os.path.splitext(frame_names[frame_idx])[0]
-        json_data_path = os.path.join(json_data_dir, f"mask_{image_base_name}.json")
-        json_data = MaskDictionaryModel().from_json(json_data_path)
-        mask_data_path = os.path.join(mask_data_dir, f"mask_{image_base_name}.npy")
-        mask_array = np.load(mask_data_path)
-        for object_id in range(start_object_id+1, current_object_count+1):
-            print("reverse tracking object", object_id)
-            object_info_dict[object_id] = json_data.labels[object_id]
-            video_predictor.add_new_mask(inference_state, frame_idx, object_id, mask_array == object_id)
+    new_object_ids = list(range(start_object_id + 1, current_object_count + 1))
+    if frame_idx == 0 or len(new_object_ids) == 0:
+        start_object_id = current_object_count
+        continue
+
+    video_predictor.reset_state(inference_state)
+    image_base_name = os.path.splitext(frame_names[frame_idx])[0]
+    json_data_path = os.path.join(json_data_dir, f"mask_{image_base_name}.json")
+    json_data = MaskDictionaryModel().from_json(json_data_path)
+    mask_data_path = os.path.join(mask_data_dir, f"mask_{image_base_name}.npy")
+    mask_array = np.load(mask_data_path)
+    added_reverse_prompt = False
+    for object_id in new_object_ids:
+        if object_id not in json_data.labels:
+            continue
+        object_mask = mask_array == object_id
+        if object_mask.sum() == 0:
+            continue
+        print("reverse tracking object", object_id)
+        object_info_dict[object_id] = json_data.labels[object_id]
+        video_predictor.add_new_mask(inference_state, frame_idx, object_id, object_mask)
+        added_reverse_prompt = True
     start_object_id = current_object_count
-        
-    
+    if not added_reverse_prompt:
+        continue
+
     for out_frame_idx, out_obj_ids, out_mask_logits in video_predictor.propagate_in_video(inference_state, max_frame_num_to_track=step*2,  start_frame_idx=frame_idx, reverse=True):
         image_base_name = os.path.splitext(frame_names[out_frame_idx])[0]
         json_data_path = os.path.join(json_data_dir, f"mask_{image_base_name}.json")
