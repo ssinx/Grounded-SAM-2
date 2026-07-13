@@ -50,14 +50,21 @@ def save_propainter_mask(mask_array, output_path):
     cv2.imwrite(output_path, propainter_mask)
 
 
-def save_empty_propainter_masks(image_name_list, mask_height, mask_width, output_dir):
+def get_aligned_frame_stem(frame_idx, name_width):
+    return f"{frame_idx:0{name_width}d}"
+
+
+def get_propainter_mask_name(frame_idx, name_width):
+    return f"{get_aligned_frame_stem(frame_idx, name_width)}.png"
+
+
+def save_empty_propainter_masks(frame_indices, mask_height, mask_width, output_dir, name_width):
     empty_mask = np.zeros((mask_height, mask_width), dtype=np.uint8)
-    for image_name in image_name_list:
-        image_base_name = os.path.splitext(image_name)[0]
-        cv2.imwrite(os.path.join(output_dir, f"mask_{image_base_name}.png"), empty_mask)
+    for frame_idx in frame_indices:
+        cv2.imwrite(os.path.join(output_dir, get_propainter_mask_name(frame_idx, name_width)), empty_mask)
 
 
-def prepare_sam2_jpeg_frames(image_dir, image_names, output_dir):
+def prepare_sam2_jpeg_frames(image_dir, image_names, output_dir, name_width):
     """
     SAM2 video predictor only accepts JPEG frames named like 0.jpg, 1.jpg, ...
     Convert/copy arbitrary input images to such a frame directory while keeping
@@ -72,7 +79,8 @@ def prepare_sam2_jpeg_frames(image_dir, image_names, output_dir):
         image = cv2.imread(image_path)
         if image is None:
             raise FileNotFoundError(f"Image file not found or unreadable: {image_path}")
-        cv2.imwrite(os.path.join(frame_dir, f"{idx}.jpg"), image)
+        frame_name = f"{get_aligned_frame_stem(idx, name_width)}.jpg"
+        cv2.imwrite(os.path.join(frame_dir, frame_name), image)
     return frame_dir
 
 # This demo shows the continuous object tracking plus reverse tracking with Grounding DINO and SAM 2
@@ -128,7 +136,8 @@ if os.path.exists(propainter_mask_dir):
 CommonUtils.creat_dirs(propainter_mask_dir)
 # scan all image names in this directory and prepare SAM2-compatible JPEG frames
 frame_names = list_images(image_dir)
-video_dir = prepare_sam2_jpeg_frames(image_dir, frame_names, output_dir)
+name_width = max(5, len(str(len(frame_names) - 1)))
+video_dir = prepare_sam2_jpeg_frames(image_dir, frame_names, output_dir, name_width)
 
 # init video predictor state
 inference_state = video_predictor.init_state(video_path=video_dir)
@@ -212,8 +221,9 @@ for start_frame_idx in range(0, len(frame_names), step):
     
     if len(mask_dict.labels) == 0:
         empty_frame_names = frame_names[start_frame_idx:start_frame_idx+step]
+        empty_frame_indices = range(start_frame_idx, start_frame_idx + len(empty_frame_names))
         mask_dict.save_empty_mask_and_json(mask_data_dir, json_data_dir, image_name_list=empty_frame_names)
-        save_empty_propainter_masks(empty_frame_names, mask_dict.mask_height, mask_dict.mask_width, propainter_mask_dir)
+        save_empty_propainter_masks(empty_frame_indices, mask_dict.mask_height, mask_dict.mask_width, propainter_mask_dir, name_width)
         print("No object detected in the frame, skip the frame {}".format(start_frame_idx))
         continue
     else:
@@ -256,7 +266,7 @@ for start_frame_idx in range(0, len(frame_names), step):
 
         mask_img = mask_img.numpy().astype(np.uint16)
         np.save(os.path.join(mask_data_dir, frame_masks_info.mask_name), mask_img)
-        propainter_mask_name = frame_masks_info.mask_name.replace(".npy", ".png")
+        propainter_mask_name = get_propainter_mask_name(frame_idx, name_width)
         save_propainter_mask(mask_img, os.path.join(propainter_mask_dir, propainter_mask_name))
 
         json_data_path = os.path.join(json_data_dir, frame_masks_info.mask_name.replace(".npy", ".json"))
@@ -316,7 +326,7 @@ for frame_idx, current_object_count in frame_object_count.items():
             mask_array[object_info.mask] = out_obj_id
         
         np.save(mask_data_path, mask_array)
-        save_propainter_mask(mask_array, os.path.join(propainter_mask_dir, f"mask_{image_base_name}.png"))
+        save_propainter_mask(mask_array, os.path.join(propainter_mask_dir, get_propainter_mask_name(out_frame_idx, name_width)))
         json_data.to_json(json_data_path)
 
         
