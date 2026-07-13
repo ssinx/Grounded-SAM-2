@@ -3,6 +3,8 @@ import cv2
 import torch
 import numpy as np
 import supervision as sv
+import argparse
+import shutil
 from PIL import Image
 from sam2.build_sam import build_sam2_video_predictor, build_sam2
 from sam2.sam2_image_predictor import SAM2ImagePredictor
@@ -14,14 +16,63 @@ from utils.mask_dictionary_model import MaskDictionaryModel, ObjectInfo
 import json
 import copy
 
+
+VALID_IMAGE_EXTENSIONS = [".jpg", ".jpeg", ".JPG", ".JPEG", ".png", ".PNG", ".bmp", ".BMP"]
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Grounded SAM2 continuous-id tracking on all images in a directory."
+    )
+    parser.add_argument("--image_dir", default="notebooks/videos/car", help="Directory containing input images.")
+    parser.add_argument("--output_dir", default="outputs", help="Directory to save masks/json/visualizations.")
+    parser.add_argument("--text", default="car.", help="Grounding text prompt, e.g. 'car.'")
+    parser.add_argument("--step", type=int, default=20, help="Run Grounding DINO every N images.")
+    parser.add_argument("--save_video", action="store_true", help="Also save an mp4 visualization video.")
+    parser.add_argument("--output_video_path", default="./outputs/output.mp4", help="Output video path when --save_video is set.")
+    return parser.parse_args()
+
+
+def list_images(image_dir):
+    image_names = [
+        p for p in os.listdir(image_dir)
+        if os.path.splitext(p)[-1] in VALID_IMAGE_EXTENSIONS
+    ]
+    image_names.sort()
+    if not image_names:
+        raise RuntimeError(f"No images found in {image_dir}")
+    return image_names
+
+
+def prepare_sam2_jpeg_frames(image_dir, image_names, output_dir):
+    """
+    SAM2 video predictor only accepts JPEG frames named like 0.jpg, 1.jpg, ...
+    Convert/copy arbitrary input images to such a frame directory while keeping
+    image_names as the mapping back to original filenames.
+    """
+    frame_dir = os.path.join(output_dir, "sam2_jpeg_frames")
+    if os.path.exists(frame_dir):
+        shutil.rmtree(frame_dir)
+    CommonUtils.creat_dirs(frame_dir)
+    for idx, image_name in enumerate(image_names):
+        image_path = os.path.join(image_dir, image_name)
+        image = cv2.imread(image_path)
+        if image is None:
+            raise FileNotFoundError(f"Image file not found or unreadable: {image_path}")
+        cv2.imwrite(os.path.join(frame_dir, f"{idx}.jpg"), image)
+    return frame_dir
+
 # This demo shows the continuous object tracking plus reverse tracking with Grounding DINO and SAM 2
 """
 Step 1: Environment settings and model initialization
 """
 # use bfloat16 for the entire notebook
-torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
+args = parse_args()
+device = "cuda" if torch.cuda.is_available() else "cpu"
+if device == "cuda":
+    torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
 
-if torch.cuda.get_device_properties(0).major >= 8:
+if torch.cuda.is_available() and torch.cuda.get_device_properties(0).major >= 8:
     # turn on tfloat32 for Ampere GPUs (https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices)
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -29,7 +80,6 @@ if torch.cuda.get_device_properties(0).major >= 8:
 # init sam image predictor and video predictor model
 sam2_checkpoint = "./checkpoints/sam2.1_hiera_large.pt"
 model_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
-device = "cuda" if torch.cuda.is_available() else "cpu"
 print("device", device)
 
 video_predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint)
@@ -45,30 +95,27 @@ grounding_model = AutoModelForZeroShotObjectDetection.from_pretrained(model_id).
 
 # setup the input image and text prompt for SAM 2 and Grounding DINO
 # VERY important: text queries need to be lowercased + end with a dot
-text = "car."
+text = args.text
 
-# `video_dir` a directory of JPEG frames with filenames like `<frame_index>.jpg`  
-video_dir = "notebooks/videos/car"
+# `image_dir` can contain jpg/png/bmp images with arbitrary filenames.
+image_dir = args.image_dir
 # 'output_dir' is the directory to save the annotated frames
-output_dir = "outputs"
+output_dir = args.output_dir
 # 'output_video_path' is the path to save the final video
-output_video_path = "./outputs/output.mp4"
+output_video_path = args.output_video_path
 # create the output directory
 mask_data_dir = os.path.join(output_dir, "mask_data")
 json_data_dir = os.path.join(output_dir, "json_data")
 result_dir = os.path.join(output_dir, "result")
 CommonUtils.creat_dirs(mask_data_dir)
 CommonUtils.creat_dirs(json_data_dir)
-# scan all the JPEG frame names in this directory
-frame_names = [
-    p for p in os.listdir(video_dir)
-    if os.path.splitext(p)[-1] in [".jpg", ".jpeg", ".JPG", ".JPEG", ".png", ".PNG"]
-]
-frame_names.sort(key=lambda p: int(os.path.splitext(p)[0]))
+# scan all image names in this directory and prepare SAM2-compatible JPEG frames
+frame_names = list_images(image_dir)
+video_dir = prepare_sam2_jpeg_frames(image_dir, frame_names, output_dir)
 
 # init video predictor state
 inference_state = video_predictor.init_state(video_path=video_dir)
-step = 20 # the step to sample frames for Grounding DINO predictor
+step = args.step # the step to sample frames for Grounding DINO predictor
 
 sam2_masks = MaskDictionaryModel()
 PROMPT_TYPE_FOR_VIDEO = "mask" # box, mask or point
@@ -82,10 +129,12 @@ for start_frame_idx in range(0, len(frame_names), step):
 # prompt grounding dino to get the box coordinates on specific frame
     print("start_frame_idx", start_frame_idx)
     # continue
-    img_path = os.path.join(video_dir, frame_names[start_frame_idx])
+    img_path = os.path.join(image_dir, frame_names[start_frame_idx])
     image = Image.open(img_path).convert("RGB")
-    image_base_name = frame_names[start_frame_idx].split(".")[0]
+    image_base_name = os.path.splitext(frame_names[start_frame_idx])[0]
     mask_dict = MaskDictionaryModel(promote_type = PROMPT_TYPE_FOR_VIDEO, mask_name = f"mask_{image_base_name}.npy")
+    mask_dict.mask_height = image.height
+    mask_dict.mask_width = image.width
 
     # run Grounding DINO on the image
     inputs = processor(images=image, text=text, return_tensors="pt").to(device)
@@ -134,7 +183,8 @@ for start_frame_idx in range(0, len(frame_names), step):
             raise NotImplementedError("SAM 2 video predictor only support mask prompts")
     else:
         print("No object detected in the frame, skip merge the frame merge {}".format(frame_names[start_frame_idx]))
-        mask_dict = sam2_masks
+        if len(sam2_masks.labels) != 0:
+            mask_dict = sam2_masks
 
     """
     Step 4: Propagate the video predictor to get the segmentation results for each frame
@@ -167,7 +217,7 @@ for start_frame_idx in range(0, len(frame_names), step):
                 object_info = ObjectInfo(instance_id = out_obj_id, mask = out_mask[0], class_name = mask_dict.get_target_class_name(out_obj_id), logit=mask_dict.get_target_logit(out_obj_id))
                 object_info.update_box()
                 frame_masks.labels[out_obj_id] = object_info
-                image_base_name = frame_names[out_frame_idx].split(".")[0]
+                image_base_name = os.path.splitext(frame_names[out_frame_idx])[0]
                 frame_masks.mask_name = f"mask_{image_base_name}.npy"
                 frame_masks.mask_height = out_mask.shape[-2]
                 frame_masks.mask_width = out_mask.shape[-1]
@@ -192,7 +242,7 @@ for start_frame_idx in range(0, len(frame_names), step):
         frame_masks_info.to_json(json_data_path)
        
 
-CommonUtils.draw_masks_and_box_with_supervision(video_dir, mask_data_dir, json_data_dir, result_dir)
+CommonUtils.draw_masks_and_box_with_supervision(image_dir, mask_data_dir, json_data_dir, result_dir)
 
 print("try reverse tracking")
 start_object_id = 0
@@ -201,7 +251,7 @@ for frame_idx, current_object_count in frame_object_count.items():
     print("reverse tracking frame", frame_idx, frame_names[frame_idx])
     if frame_idx != 0:
         video_predictor.reset_state(inference_state)
-        image_base_name = frame_names[frame_idx].split(".")[0]
+        image_base_name = os.path.splitext(frame_names[frame_idx])[0]
         json_data_path = os.path.join(json_data_dir, f"mask_{image_base_name}.json")
         json_data = MaskDictionaryModel().from_json(json_data_path)
         mask_data_path = os.path.join(mask_data_dir, f"mask_{image_base_name}.npy")
@@ -214,7 +264,7 @@ for frame_idx, current_object_count in frame_object_count.items():
         
     
     for out_frame_idx, out_obj_ids, out_mask_logits in video_predictor.propagate_in_video(inference_state, max_frame_num_to_track=step*2,  start_frame_idx=frame_idx, reverse=True):
-        image_base_name = frame_names[out_frame_idx].split(".")[0]
+        image_base_name = os.path.splitext(frame_names[out_frame_idx])[0]
         json_data_path = os.path.join(json_data_dir, f"mask_{image_base_name}.json")
         json_data = MaskDictionaryModel().from_json(json_data_path)
         mask_data_path = os.path.join(mask_data_dir, f"mask_{image_base_name}.npy")
@@ -242,6 +292,7 @@ for frame_idx, current_object_count in frame_object_count.items():
 """
 Step 6: Draw the results and save the video
 """
-CommonUtils.draw_masks_and_box_with_supervision(video_dir, mask_data_dir, json_data_dir, result_dir+"_reverse")
+CommonUtils.draw_masks_and_box_with_supervision(image_dir, mask_data_dir, json_data_dir, result_dir+"_reverse")
 
-create_video_from_images(result_dir, output_video_path, frame_rate=15)
+if args.save_video:
+    create_video_from_images(result_dir, output_video_path, frame_rate=15)
