@@ -45,8 +45,11 @@ def list_images(image_dir):
     return image_names
 
 
-def save_propainter_mask(mask_array, output_path):
-    propainter_mask = (mask_array > 0).astype(np.uint8) * 255
+def save_propainter_mask(mask_array, output_path, object_id=None):
+    if object_id is None:
+        propainter_mask = (mask_array > 0).astype(np.uint8) * 255
+    else:
+        propainter_mask = (mask_array == object_id).astype(np.uint8) * 255
     cv2.imwrite(output_path, propainter_mask)
 
 
@@ -58,10 +61,123 @@ def get_propainter_mask_name(frame_idx, name_width):
     return f"{get_aligned_frame_stem(frame_idx, name_width)}.png"
 
 
-def save_empty_propainter_masks(frame_indices, mask_height, mask_width, output_dir, name_width):
+def get_object_propainter_mask_dir(output_dir, object_id):
+    return os.path.join(output_dir, f"object_{int(object_id):06d}")
+
+
+def save_empty_propainter_masks(frame_indices, mask_height, mask_width, output_dir, name_width, object_ids=None):
     empty_mask = np.zeros((mask_height, mask_width), dtype=np.uint8)
-    for frame_idx in frame_indices:
-        cv2.imwrite(os.path.join(output_dir, get_propainter_mask_name(frame_idx, name_width)), empty_mask)
+    if object_ids is None:
+        CommonUtils.creat_dirs(output_dir)
+        output_dirs = [output_dir]
+    else:
+        output_dirs = []
+        for object_id in object_ids:
+            object_output_dir = get_object_propainter_mask_dir(output_dir, object_id)
+            CommonUtils.creat_dirs(object_output_dir)
+            output_dirs.append(object_output_dir)
+
+    for output_dir in output_dirs:
+        for frame_idx in frame_indices:
+            cv2.imwrite(os.path.join(output_dir, get_propainter_mask_name(frame_idx, name_width)), empty_mask)
+
+
+def ensure_object_propainter_mask_dir(output_dir, object_id, current_frame_idx, mask_height, mask_width, name_width):
+    object_output_dir = get_object_propainter_mask_dir(output_dir, object_id)
+    if not os.path.exists(object_output_dir):
+        CommonUtils.creat_dirs(object_output_dir)
+        save_empty_propainter_masks(range(current_frame_idx), mask_height, mask_width, object_output_dir, name_width)
+    return object_output_dir
+
+
+def save_propainter_masks_by_object_id(mask_array, frame_idx, output_dir, name_width, object_ids):
+    mask_height, mask_width = mask_array.shape
+    for object_id in sorted(object_ids):
+        object_output_dir = ensure_object_propainter_mask_dir(
+            output_dir,
+            object_id,
+            frame_idx,
+            mask_height,
+            mask_width,
+            name_width,
+        )
+        save_propainter_mask(
+            mask_array,
+            os.path.join(object_output_dir, get_propainter_mask_name(frame_idx, name_width)),
+            object_id=object_id,
+        )
+
+
+def finalize_object_propainter_masks(output_dir, object_ids, total_frames, mask_height, mask_width, name_width):
+    empty_mask = np.zeros((mask_height, mask_width), dtype=np.uint8)
+    expected_frame_names = [get_propainter_mask_name(frame_idx, name_width) for frame_idx in range(total_frames)]
+    for object_id in sorted(object_ids):
+        object_output_dir = ensure_object_propainter_mask_dir(
+            output_dir,
+            object_id,
+            total_frames,
+            mask_height,
+            mask_width,
+            name_width,
+        )
+        for frame_name in expected_frame_names:
+            output_path = os.path.join(object_output_dir, frame_name)
+            if not os.path.exists(output_path):
+                cv2.imwrite(output_path, empty_mask)
+
+
+def get_ids_from_mask_array(mask_array):
+    return {int(object_id) for object_id in np.unique(mask_array) if int(object_id) != 0}
+
+
+def get_mask_size_from_image(image_dir, image_name):
+    image_path = os.path.join(image_dir, image_name)
+    image = cv2.imread(image_path)
+    if image is None:
+        raise FileNotFoundError(f"Image file not found or unreadable: {image_path}")
+    return image.shape[:2]
+
+
+def get_output_mask_size(image_dir, frame_names, mask_data_dir):
+    for frame_name in frame_names:
+        image_base_name = os.path.splitext(frame_name)[0]
+        mask_data_path = os.path.join(mask_data_dir, f"mask_{image_base_name}.npy")
+        if os.path.exists(mask_data_path):
+            return np.load(mask_data_path).shape
+    return get_mask_size_from_image(image_dir, frame_names[0])
+
+
+def rebuild_propainter_masks_by_object_id(mask_data_dir, output_dir, frame_names, image_dir, name_width):
+    object_ids = set()
+    mask_height, mask_width = None, None
+    for frame_name in frame_names:
+        image_base_name = os.path.splitext(frame_name)[0]
+        mask_data_path = os.path.join(mask_data_dir, f"mask_{image_base_name}.npy")
+        if not os.path.exists(mask_data_path):
+            continue
+        mask_array = np.load(mask_data_path)
+        mask_height, mask_width = mask_array.shape
+        object_ids.update(get_ids_from_mask_array(mask_array))
+
+    if mask_height is None or mask_width is None:
+        mask_height, mask_width = get_mask_size_from_image(image_dir, frame_names[0])
+
+    if os.path.exists(output_dir):
+        shutil.rmtree(output_dir)
+    CommonUtils.creat_dirs(output_dir)
+
+    for frame_idx, frame_name in enumerate(frame_names):
+        image_base_name = os.path.splitext(frame_name)[0]
+        mask_data_path = os.path.join(mask_data_dir, f"mask_{image_base_name}.npy")
+        if os.path.exists(mask_data_path):
+            mask_array = np.load(mask_data_path)
+        else:
+            mask_array = np.zeros((mask_height, mask_width), dtype=np.uint16)
+        save_propainter_mask(mask_array, os.path.join(output_dir, get_propainter_mask_name(frame_idx, name_width)))
+        save_propainter_masks_by_object_id(mask_array, frame_idx, output_dir, name_width, object_ids)
+
+    finalize_object_propainter_masks(output_dir, object_ids, len(frame_names), mask_height, mask_width, name_width)
+    return object_ids
 
 
 def prepare_sam2_jpeg_frames(image_dir, image_names, output_dir, name_width):
@@ -221,9 +337,7 @@ for start_frame_idx in range(0, len(frame_names), step):
     
     if len(mask_dict.labels) == 0:
         empty_frame_names = frame_names[start_frame_idx:start_frame_idx+step]
-        empty_frame_indices = range(start_frame_idx, start_frame_idx + len(empty_frame_names))
         mask_dict.save_empty_mask_and_json(mask_data_dir, json_data_dir, image_name_list=empty_frame_names)
-        save_empty_propainter_masks(empty_frame_indices, mask_dict.mask_height, mask_dict.mask_width, propainter_mask_dir, name_width)
         print("No object detected in the frame, skip the frame {}".format(start_frame_idx))
         continue
     else:
@@ -266,8 +380,6 @@ for start_frame_idx in range(0, len(frame_names), step):
 
         mask_img = mask_img.numpy().astype(np.uint16)
         np.save(os.path.join(mask_data_dir, frame_masks_info.mask_name), mask_img)
-        propainter_mask_name = get_propainter_mask_name(frame_idx, name_width)
-        save_propainter_mask(mask_img, os.path.join(propainter_mask_dir, propainter_mask_name))
 
         json_data_path = os.path.join(json_data_dir, frame_masks_info.mask_name.replace(".npy", ".json"))
         frame_masks_info.to_json(json_data_path)
@@ -326,7 +438,6 @@ for frame_idx, current_object_count in frame_object_count.items():
             mask_array[object_info.mask] = out_obj_id
         
         np.save(mask_data_path, mask_array)
-        save_propainter_mask(mask_array, os.path.join(propainter_mask_dir, get_propainter_mask_name(out_frame_idx, name_width)))
         json_data.to_json(json_data_path)
 
         
@@ -336,6 +447,9 @@ for frame_idx, current_object_count in frame_object_count.items():
 """
 Step 6: Draw the results and save the video
 """
+object_propainter_ids = rebuild_propainter_masks_by_object_id(mask_data_dir, propainter_mask_dir, frame_names, image_dir, name_width)
+print("Saved per-object ProPainter masks:", sorted(object_propainter_ids))
+
 CommonUtils.draw_masks_and_box_with_supervision(image_dir, mask_data_dir, json_data_dir, result_dir+"_reverse")
 
 if args.save_video:
