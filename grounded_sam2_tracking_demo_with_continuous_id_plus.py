@@ -28,6 +28,10 @@ def parse_args():
     parser.add_argument("--output_dir", default="outputs", help="Directory to save masks/json/visualizations.")
     parser.add_argument("--text", default="car.", help="Grounding text prompt, e.g. 'car.'")
     parser.add_argument("--step", type=int, default=20, help="Run Grounding DINO every N images.")
+    parser.add_argument("--box_threshold", type=float, default=0.25, help="Grounding DINO box confidence threshold. Lower it to reduce missed detections.")
+    parser.add_argument("--text_threshold", type=float, default=0.25, help="Grounding DINO text matching threshold. Lower it to reduce missed detections.")
+    parser.add_argument("--id_iou_threshold", type=float, default=0.8, help="IoU threshold for merging new detections with existing tracked IDs.")
+    parser.add_argument("--mask_threshold", type=float, default=0.0, help="SAM2 video mask logit threshold used during forward and reverse propagation.")
     parser.add_argument("--save_video", action="store_true", help="Also save an mp4 visualization video.")
     parser.add_argument("--output_video_path", default="./outputs/output.mp4", help="Output video path when --save_video is set.")
     parser.add_argument("--propainter_mask_dir", default="propainter_masks", help="Subdirectory to save ProPainter-compatible binary PNG masks.")
@@ -258,6 +262,18 @@ video_dir = prepare_sam2_jpeg_frames(image_dir, frame_names, output_dir, name_wi
 # init video predictor state
 inference_state = video_predictor.init_state(video_path=video_dir)
 step = args.step # the step to sample frames for Grounding DINO predictor
+box_threshold = args.box_threshold
+text_threshold = args.text_threshold
+id_iou_threshold = args.id_iou_threshold
+mask_threshold = args.mask_threshold
+
+print(
+    "Thresholds:",
+    f"box={box_threshold}",
+    f"text={text_threshold}",
+    f"id_iou={id_iou_threshold}",
+    f"mask={mask_threshold}",
+)
 
 sam2_masks = MaskDictionaryModel()
 PROMPT_TYPE_FOR_VIDEO = "mask" # box, mask or point
@@ -286,8 +302,8 @@ for start_frame_idx in range(0, len(frame_names), step):
     results = processor.post_process_grounded_object_detection(
         outputs,
         inputs.input_ids,
-        threshold=0.25,
-        text_threshold=0.25,
+        threshold=box_threshold,
+        text_threshold=text_threshold,
         target_sizes=[image.size[::-1]]
     )
 
@@ -331,7 +347,7 @@ for start_frame_idx in range(0, len(frame_names), step):
     """
     Step 4: Propagate the video predictor to get the segmentation results for each frame
     """
-    objects_count = mask_dict.update_masks(tracking_annotation_dict=sam2_masks, iou_threshold=0.8, objects_count=objects_count)
+    objects_count = mask_dict.update_masks(tracking_annotation_dict=sam2_masks, iou_threshold=id_iou_threshold, objects_count=objects_count)
     frame_object_count[start_frame_idx] = objects_count
     print("objects_count", objects_count)
     
@@ -356,7 +372,7 @@ for start_frame_idx in range(0, len(frame_names), step):
             frame_masks = MaskDictionaryModel()
             
             for i, out_obj_id in enumerate(out_obj_ids):
-                out_mask = (out_mask_logits[i] > 0.0) # .cpu().numpy()
+                out_mask = (out_mask_logits[i] > mask_threshold) # .cpu().numpy()
                 object_info = ObjectInfo(instance_id = out_obj_id, mask = out_mask[0], class_name = mask_dict.get_target_class_name(out_obj_id), logit=mask_dict.get_target_logit(out_obj_id))
                 object_info.update_box()
                 frame_masks.labels[out_obj_id] = object_info
@@ -426,7 +442,7 @@ for frame_idx, current_object_count in frame_object_count.items():
         mask_array = np.load(mask_data_path)
         # merge the reverse tracking masks with the original masks
         for i, out_obj_id in enumerate(out_obj_ids):
-            out_mask = (out_mask_logits[i] > 0.0).cpu()
+            out_mask = (out_mask_logits[i] > mask_threshold).cpu()
             if out_mask.sum() == 0:
                 print("no mask for object", out_obj_id, "at frame", out_frame_idx)
                 continue
